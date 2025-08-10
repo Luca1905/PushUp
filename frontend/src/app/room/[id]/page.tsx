@@ -1,115 +1,174 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { notFound, useParams, useRouter } from "next/navigation";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
-import { Progress } from "@/components/ui/progress";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { cn } from "@/lib/utils";
-import { usePushupStore } from "@/hooks/use-pushup-store";
-import { ParticipantItem } from "@/components/participant-item";
-import { PushupControls } from "@/components/pushup-controls";
-import { Copy, Timer, Users, ChevronLeft, Play, Square } from "lucide-react";
+import { ChevronLeft } from "lucide-react";
+import * as vision from "@mediapipe/tasks-vision";
 
 export default function RoomPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
-  const {
-    getRoomById,
-    you,
-    joinRoomById,
-    toggleSession,
-    incrementYourPushups,
-    setYourName,
-    upsertRoom,
-  } = usePushupStore();
-  const [copied, setCopied] = useState(false);
+
+  const roomId = params.id;
   const [nameDraft, setNameDraft] = useState("");
-  const [joined, setJoined] = useState(false);
-  const room = getRoomById(params.id);
-
+  const [leaderboard, setLeaderboard] = useState<any[]>([]);
   const [count, setCount] = useState(0);
-  const [leaderboard, setLeaderboard] = useState([]);
-  const [running, setRunning] = useState(true);
+  const [running, setRunning] = useState(false);
+
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const poseRef = useRef<any>(null);
+  const stageRef = useRef<"UP" | "DOWN">("UP");
+  const sentCountRef = useRef(-1);
+  const lastSentTsRef = useRef(0);
+  const lastTsRef = useRef(0);
 
   useEffect(() => {
-    if (!room) {
-      return notFound();
-    }
-    setNameDraft(room.name);
-  }, [room]);
+    if (!roomId) return notFound();
+    setNameDraft("Player"); // default
+  }, [roomId]);
 
-  useEffect(() => {
-    if (!room) return;
-    if (!room.participants.some((p) => p.id === you.id)) {
-      joinRoomById(room.id);
-      setJoined(true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [room, you.id]);
+  // Setup camera
+  const setupCamera = async () => {
+    console.log(videoRef.current);
+    if (!videoRef.current) return;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user" },
+      audio: false,
+    });
+    videoRef.current.srcObject = stream;
+    await videoRef.current.play(); };
 
-  // Pseudo-realtime: other participants push randomly when active
-  const tickRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (!room || !room.isActive) {
-      if (tickRef.current) {
-        window.clearInterval(tickRef.current);
-        tickRef.current = null;
-      }
-      return;
-    }
-    if (tickRef.current) return;
-    tickRef.current = window.setInterval(() => {
-      const updated = { ...room };
-      let changed = false;
-      updated.participants = updated.participants.map((p) => {
-        if (p.id === you.id) return p;
-        // 50% chance to add 1-3 pushups
-        if (Math.random() < 0.5) {
-          const inc = 1 + Math.floor(Math.random() * 3);
-          changed = true;
-          return { ...p, pushups: p.pushups + inc, status: "pushing" };
-        }
-        // 20% chance resting
-        if (Math.random() < 0.2) {
-          return { ...p, status: "resting" };
-        }
-        return { ...p, status: "ready" };
-      });
-      if (changed) {
-        upsertRoom(updated);
-      }
-    }, 1500);
+  // Setup Mediapipe Pose
+  const setupPose = async () => {
+    const { FilesetResolver, PoseLandmarker } = vision;
+    const fileset = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm",
+    );
+    poseRef.current = await PoseLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+      },
+      runningMode: "VIDEO",
+      numPoses: 1,
+    });
+  };
 
-    return () => {
-      if (tickRef.current) {
-        window.clearInterval(tickRef.current);
-        tickRef.current = null;
-      }
-    };
-  }, [room, upsertRoom, you.id]);
+  // Angle helper
+  const angleDeg = (
+    ax: number,
+    ay: number,
+    bx: number,
+    by: number,
+    cx: number,
+    cy: number,
+  ) => {
+    const baxx = ax - bx,
+      baxy = ay - by;
+    const bcx = cx - bx,
+      bcy = cy - by;
+    const nba = Math.hypot(baxx, baxy) || 1;
+    const nbc = Math.hypot(bcx, bcy) || 1;
+    const dot = (baxx / nba) * (bcx / nbc) + (baxy / nba) * (bcy / nbc);
+    const clamped = Math.max(-1, Math.min(1, dot));
+    return (Math.acos(clamped) * 180) / Math.PI;
+  };
 
-  const goal = room?.goal ?? 100;
-  const total = room?.participants.reduce((acc, p) => acc + p.pushups, 0) ?? 0;
-  const percent = Math.min(100, Math.round((total / goal) * 100));
-
-  const onCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(room?.code || "");
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1000);
-    } catch {
-      setCopied(false);
+  // Send WS update
+  const sendUpdateMaybe = () => {
+    const now = performance.now() / 1000;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    if (count !== sentCountRef.current || now - lastSentTsRef.current > 2.0) {
+      wsRef.current.send(JSON.stringify({ type: "update", count: count | 0 }));
+      sentCountRef.current = count;
+      lastSentTsRef.current = now;
     }
   };
 
-  if (!room) {
-    return notFound();
-  }
+  // Connect WebSocket
+  const connectWS = (room: string, name: string) => {
+    if (wsRef.current)
+      try {
+        wsRef.current.close();
+      } catch {}
+    const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+    const uri = `${wsScheme}://${location.host}/ws/${room}?name=${encodeURIComponent(name)}`;
+    wsRef.current = new WebSocket(uri);
+    wsRef.current.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (["leaderboard", "join", "leave"].includes(data.type)) {
+          setLeaderboard(Array.isArray(data.players) ? data.players : []);
+        }
+      } catch {}
+    };
+  };
+
+  // Main loop
+  const loop = async () => {
+    if (
+      !running ||
+      !videoRef.current ||
+      !canvasRef.current ||
+      !poseRef.current
+    ) {
+      requestAnimationFrame(loop);
+      return;
+    }
+    const ctx = canvasRef.current.getContext("2d");
+    const vw = videoRef.current.videoWidth;
+    const vh = videoRef.current.videoHeight;
+    if (vw === 0 || vh === 0) return requestAnimationFrame(loop);
+
+    if (canvasRef.current.width !== vw || canvasRef.current.height !== vh) {
+      canvasRef.current.width = vw;
+      canvasRef.current.height = vh;
+    }
+
+    const now = performance.now();
+    const res = await poseRef.current.detectForVideo(videoRef.current, now);
+    ctx?.drawImage(videoRef.current, 0, 0, vw, vh);
+
+    if (res.landmarks && res.landmarks.length > 0) {
+      const lms = res.landmarks[0];
+      const s = lms[12],
+        e = lms[14],
+        w = lms[16];
+      if (s && e && w) {
+        const sx = s.x * vw,
+          sy = s.y * vh;
+        const ex = e.x * vw,
+          ey = e.y * vh;
+        const wx = w.x * vw,
+          wy = w.y * vh;
+        const ang = angleDeg(sx, sy, ex, ey, wx, wy);
+
+        if (ang < 70 && stageRef.current === "UP") stageRef.current = "DOWN";
+        else if (ang > 160 && stageRef.current === "DOWN") {
+          stageRef.current = "UP";
+          setCount((c) => c + 1);
+          sendUpdateMaybe();
+        }
+      }
+    }
+
+    lastTsRef.current = now;
+    requestAnimationFrame(loop);
+  };
+
+  // Start session
+  const startSession = async () => {
+    await setupCamera();
+    await setupPose();
+    connectWS(roomId, nameDraft);
+    setRunning(true);
+    requestAnimationFrame(loop);
+  };
 
   return (
     <main className="min-h-[100dvh]">
@@ -117,27 +176,10 @@ export default function RoomPage() {
         <div className="container mx-auto flex items-center gap-3 px-4 py-3">
           <Button variant="ghost" size="icon" onClick={() => router.push("/")}>
             <ChevronLeft className="size-5" />
-            <span className="sr-only">Back</span>
           </Button>
-          <div className="font-semibold">{room.name}</div>
-          <Badge
-            variant={room.isActive ? "default" : "secondary"}
-            className="ml-2"
-          >
-            {room.isActive ? "Active" : "Paused"}
-          </Badge>
+          <div className="font-semibold">Room {roomId}</div>
           <div className="ml-auto flex items-center gap-2">
-            <Badge variant="outline" className="font-mono">
-              Code: {room.code}
-            </Badge>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={onCopy}
-              aria-label="Copy room code"
-            >
-              <Copy className="size-4" />
-            </Button>
+            <Button onClick={startSession}>Connect & Start</Button>
           </div>
         </div>
       </header>
@@ -145,67 +187,13 @@ export default function RoomPage() {
       <section className="container mx-auto grid gap-6 px-4 py-6 lg:grid-cols-[1.2fr_0.8fr]">
         <div className="grid gap-4">
           <Card>
-            <CardHeader className="flex flex-col gap-2">
-              <div className="flex items-center gap-2">
-                <Timer className="size-4 text-emerald-600" aria-hidden="true" />
-                <CardTitle>Session</CardTitle>
-                <div className="ml-auto flex items-center gap-2">
-                  <Button
-                    size="sm"
-                    variant={room.isActive ? "destructive" : "default"}
-                    onClick={() => toggleSession(room.id)}
-                  >
-                    {room.isActive ? (
-                      <>
-                        <Square className="mr-2 size-4" />
-                        Stop
-                      </>
-                    ) : (
-                      <>
-                        <Play className="mr-2 size-4" />
-                        Start
-                      </>
-                    )}
-                  </Button>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="text-muted-foreground text-sm">
-                  Goal: <span className="font-medium">{goal}</span> total
-                  push-ups
-                </div>
-                <div className="text-muted-foreground text-sm">
-                  Team:{" "}
-                  <span className="font-medium">
-                    {room.participants.length}
-                  </span>{" "}
-                  people
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="grid gap-3">
-              <div className="flex items-center justify-between text-sm">
-                <div className="text-muted-foreground">Team total</div>
-                <div className="font-semibold">{total}</div>
-              </div>
-              <Progress value={percent} className="h-2" />
-              <div className="text-muted-foreground text-xs">
-                {percent}% of {goal}
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
             <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Users className="size-4 text-emerald-600" aria-hidden="true" />
-                Participants
-              </CardTitle>
+              <CardTitle>Push-up Counter</CardTitle>
             </CardHeader>
-            <CardContent className="grid gap-3">
-              {room.participants.map((p) => (
-                <ParticipantItem key={p.id} participant={p} youId={you.id} />
-              ))}
+            <CardContent>
+              <video ref={videoRef} playsInline muted />
+              <canvas ref={canvasRef} />
+              <div className="mt-2 font-bold">Reps: {count}</div>
             </CardContent>
           </Card>
         </div>
@@ -213,96 +201,17 @@ export default function RoomPage() {
         <div className="grid gap-4">
           <Card>
             <CardHeader>
-              <CardTitle>Your controls</CardTitle>
-            </CardHeader>
-            <CardContent className="grid gap-4">
-              <div className="flex items-center gap-3">
-                <Avatar className="size-10">
-                  <AvatarImage
-                    src={you.avatar || "/placeholder.svg"}
-                    alt="Your avatar"
-                  />
-                  <AvatarFallback>YOU</AvatarFallback>
-                </Avatar>
-                <div className="grid gap-1">
-                  <div className="font-semibold">{you.name}</div>
-                  <div className="text-muted-foreground text-xs">
-                    Change your display name
-                  </div>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <Input
-                  value={nameDraft}
-                  onChange={(e) => setNameDraft(e.target.value)}
-                  placeholder="Your name"
-                  aria-label="Your name"
-                />
-                <Button
-                  variant="outline"
-                  onClick={() => setYourName(nameDraft)}
-                  disabled={!nameDraft.trim()}
-                >
-                  Save
-                </Button>
-              </div>
-
-              <Separator />
-
-              <PushupControls
-                onAdd={(n) => incrementYourPushups(room.id, n)}
-                onUndo={() => incrementYourPushups(room.id, -1)}
-                currentCount={
-                  room.participants.find((p) => p.id === you.id)?.pushups ?? 0
-                }
-              />
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
               <CardTitle>Leaderboard</CardTitle>
             </CardHeader>
-            <CardContent className="grid gap-3">
-              {leaderboard.map((p, i) => {
-                const rank = i + 1;
-                return (
-                  <div
-                    key={p.id}
-                    className={cn(
-                      "flex items-center justify-between rounded-md border p-2",
-                      p.id === you.id && "bg-emerald-50",
-                    )}
-                  >
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={cn(
-                          "w-6 text-right font-mono",
-                          rank <= 3
-                            ? "text-emerald-700"
-                            : "text-muted-foreground",
-                        )}
-                      >
-                        {rank}
-                      </div>
-                      <Avatar className="size-8">
-                        <AvatarImage
-                          src={p.avatar || "/placeholder.svg"}
-                          alt={`${p.name}'s avatar`}
-                        />
-                        <AvatarFallback>
-                          {p.name.slice(0, 2).toUpperCase()}
-                        </AvatarFallback>
-                      </Avatar>
-                      <div className="font-medium">
-                        {p.name}
-                        {p.id === you.id ? " (You)" : ""}
-                      </div>
-                    </div>
-                    <div className="font-semibold">{p.pushups}</div>
-                  </div>
-                );
-              })}
+            <CardContent>
+              {leaderboard.map((p, i) => (
+                <div key={p.id} className="flex justify-between">
+                  <span>
+                    {i + 1}. {p.name}
+                  </span>
+                  <span>{p.count}</span>
+                </div>
+              ))}
             </CardContent>
           </Card>
         </div>

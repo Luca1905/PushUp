@@ -116,8 +116,6 @@ export default function Page() {
             <CardFooter></CardFooter>
           </Card>
         </div>
-
-        <Separator />
       </section>
 
       <CreateRoomDialog open={createOpen} onOpenChange={setCreateOpen} />
