@@ -6,13 +6,23 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
       body { margin: 0; background: #111; color: #eee; font-family: system-ui, Arial, sans-serif; }
-      header { padding: 10px; background: #222; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-      header input { padding: 6px 10px; background: #111; color: #eee; border: 1px solid #444; border-radius: 6px; }
-      header button { padding: 6px 12px; background: #0a84ff; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
-      main { position: relative; display: flex; justify-content: center; padding: 10px; }
-      #wrap { position: relative; }
-      video, canvas { max-width: 98vw; max-height: 80vh; border-radius: 8px; }
-      #status { margin-left: auto; opacity: .8; }
+      header { padding: 12px; background: #222; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; position: sticky; top: 0; z-index: 10; border-bottom: 1px solid #333; }
+      header label { display: flex; align-items: center; gap: 6px; }
+      header input { padding: 10px 12px; background: #111; color: #eee; border: 1px solid #444; border-radius: 10px; }
+      header button { padding: 10px 14px; background: #0a84ff; color: #fff; border: 0; border-radius: 10px; cursor: pointer; font-weight: 600; }
+      header button:hover { filter: brightness(1.1); }
+      main { position: relative; display: flex; justify-content: center; padding: 16px; }
+      #wrap { position: relative; width: min(96vw, 1100px); margin-inline: auto; }
+      /* Make video the base layer; canvas overlays it */
+      #wrap video { display: block; width: 100%; height: auto; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.45); background: #000; }
+      #wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 12px; pointer-events: none; }
+      #status { margin-left: auto; opacity: .9; padding: 6px 10px; border-radius: 999px; background: #1b1b1b; border: 1px solid #333; }
+      @media (max-width: 640px) {
+        header { gap: 8px; }
+        header label { flex: 1; min-width: 120px; }
+        header input { width: 100%; box-sizing: border-box; }
+        #wrap { width: 100vw; }
+      }
     </style>
     <script type="module">
       import { FilesetResolver, PoseLandmarker, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
@@ -133,17 +143,17 @@
           els.canvas.width = vw; els.canvas.height = vh;
         }
 
+        // clear overlay (video is visible underneath)
+        ctx.clearRect(0, 0, vw, vh);
+
         // Run pose
         if (pose) {
           const now = performance.now();
           const res = await pose.detectForVideo(els.video, now);
-          // draw camera
-          ctx.drawImage(els.video, 0, 0, vw, vh);
 
-          // draw landmarks and count
+          // draw landmarks and count (do not draw the video on the canvas)
           if (res.landmarks && res.landmarks.length > 0) {
             const lms = res.landmarks[0]; // 33 BlazePose points
-            // Right side indices: shoulder=12, elbow=14, wrist=16
             const s = lms[12], e = lms[14], w = lms[16];
             if (s && e && w) {
               // normalized->pixel
@@ -168,11 +178,7 @@
               for (const p of [s, e, w]) {
                 ctx.beginPath(); ctx.arc(p.x * vw, p.y * vh, 5, 0, Math.PI * 2); ctx.fill();
               }
-            } else {
-              ctx.drawImage(els.video, 0, 0, vw, vh);
             }
-          } else {
-            ctx.drawImage(els.video, 0, 0, vw, vh);
           }
 
           // FPS (rough)
@@ -232,7 +238,7 @@
     </header>
     <main>
       <div id="wrap">
-        <video id="video" playsinline muted></video>
+        <video id="video" playsinline muted autoplay></video>
         <canvas id="canvas"></canvas>
       </div>
     </main>
