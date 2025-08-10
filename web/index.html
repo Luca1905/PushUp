@@ -24,8 +24,13 @@
         #wrap { width: 100vw; }
       }
     </style>
+
+    <!-- New: TFJS + Pose Detection (MoveNet) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+
     <script type="module">
-      import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+      // Using TFJS MoveNet (pose-detection)
 
       const els = { room: null, name: null, connectBtn: null, status: null, video: null, canvas: null };
 
@@ -33,7 +38,7 @@
       let leader = [];
       let count = 0, sentCount = -1, lastSentTs = 0;
       let lastTs = 0;
-      let pose = null;
+      let pose = null; // TFJS MoveNet detector
       let running = false;
 
       class PoseDetector {
@@ -44,6 +49,7 @@
           ctx.fillStyle = "#00d0ff";
           for (let i = 0; i < lms.length; i++) {
             const p = lms[i];
+            if (!p || p.x == null || p.y == null) continue;
             ctx.beginPath();
             ctx.arc(p.x * vw, p.y * vh, 3, 0, Math.PI * 2);
             ctx.fill();
@@ -58,44 +64,69 @@
           if (lms && lms.length) {
             for (let id = 0; id < lms.length; id++) {
               const lm = lms[id];
+              if (!lm) { lmList.push(null); continue; }
               const cx = Math.round(lm.x * vw);
               const cy = Math.round(lm.y * vh);
               const cz = Math.round((lm.z || 0) * vw);
               lmList.push([id, cx, cy, cz]);
             }
-            const ad = Math.abs(lmList[12][1] - lmList[11][1]) >> 1;
+            const hasL = lmList[11] && lmList[12];
+            const ad = hasL ? (Math.abs(lmList[12][1] - lmList[11][1]) >> 1) : 20;
             let x1, x2;
-            if (bboxWithHands) {
-              x1 = lmList[16][1] - ad;
-              x2 = lmList[15][1] + ad;
+            if (hasL) {
+              if (bboxWithHands && lmList[15] && lmList[16]) {
+                x1 = lmList[16][1] - ad;
+                x2 = lmList[15][1] + ad;
+              } else {
+                x1 = lmList[12][1] - ad;
+                x2 = lmList[11][1] + ad;
+              }
             } else {
-              x1 = lmList[12][1] - ad;
-              x2 = lmList[11][1] + ad;
+              // Fallback to hips if shoulders missing
+              if (lmList[23] && lmList[24]) {
+                x1 = Math.min(lmList[23][1], lmList[24][1]) - ad;
+                x2 = Math.max(lmList[23][1], lmList[24][1]) + ad;
+              }
             }
-            const y2 = lmList[29][2] + ad;
-            const y1 = lmList[1][2] - ad;
-            const bbox = [x1, y1, x2 - x1, y2 - y1];
-            const cx = bbox[0] + (bbox[2] >> 1);
-            const cy = bbox[1] + (bbox[3] >> 1);
-            bboxInfo = { bbox, center: [cx, cy] };
-
-            const neck_x = Math.round((lmList[12][1] + lmList[11][1]) / 2);
-            const neck_y = Math.round((lmList[12][2] + lmList[11][2]) / 2);
-            extra_feature = [neck_x, neck_y];
-
-            if (draw && ctx) {
-              ctx.save();
-              ctx.strokeStyle = "rgba(255,0,255,0.9)";
-              ctx.lineWidth = 3;
-              ctx.strokeRect(bbox[0], bbox[1], bbox[2], bbox[3]);
-              ctx.fillStyle = "#0f0";
-              ctx.beginPath();
-              ctx.arc(neck_x, neck_y, 5, 0, Math.PI * 2);
-              ctx.fill();
-              ctx.restore();
+            // Bottom of bbox: prefer heel(29) -> ankle(27/28) -> hips
+            const y2cand = [
+              lmList[29]?.[2], lmList[27]?.[2], lmList[28]?.[2],
+              lmList[25]?.[2], lmList[26]?.[2], lmList[23]?.[2], lmList[24]?.[2]
+            ].filter(v => typeof v === "number");
+            const y2 = (y2cand.length ? Math.max(...y2cand) : (vh - 1)) + ad;
+            // Top of bbox: prefer left_eye(1) -> nose(0) -> shoulders
+            const y1cand = [
+              lmList[1]?.[2], lmList[0]?.[2], lmList[11]?.[2], lmList[12]?.[2]
+            ].filter(v => typeof v === "number");
+            const y1 = (y1cand.length ? Math.min(...y1cand) : 0) - ad;
+            if (typeof x1 === "number" && typeof x2 === "number") {
+             const bbox = [x1, y1, x2 - x1, y2 - y1];
+             const cx = bbox[0] + (bbox[2] >> 1);
+             const cy = bbox[1] + (bbox[3] >> 1);
+             bboxInfo = { bbox, center: [cx, cy] };
             }
-          }
-          return { lmList, bboxInfo, extra_feature };
+
+            if (hasL) {
+              const neck_x = Math.round((lmList[12][1] + lmList[11][1]) / 2);
+              const neck_y = Math.round((lmList[12][2] + lmList[11][2]) / 2);
+              extra_feature = [neck_x, neck_y];
+            }
+ 
+             if (draw && ctx) {
+               ctx.save();
+               ctx.strokeStyle = "rgba(255,0,255,0.9)";
+               ctx.lineWidth = 3;
+               if (bboxInfo.bbox) ctx.strokeRect(bboxInfo.bbox[0], bboxInfo.bbox[1], bboxInfo.bbox[2], bboxInfo.bbox[3]);
+               if (extra_feature) {
+                 ctx.fillStyle = "#0f0";
+                 ctx.beginPath();
+                 ctx.arc(extra_feature[0], extra_feature[1], 5, 0, Math.PI * 2);
+                 ctx.fill();
+               }
+               ctx.restore();
+             }
+           }
+           return { lmList, bboxInfo, extra_feature };
         }
       }
 
@@ -159,13 +190,9 @@
       }
 
       async function setupPose() {
-        const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
-        pose = await PoseLandmarker.createFromOptions(fileset, {
-          baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
-          },
-          runningMode: "VIDEO",
-          numPoses: 1,
+        // Load MoveNet SinglePose Lightning
+        pose = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
+          modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING
         });
       }
 
@@ -209,12 +236,35 @@
         ctx.clearRect(0, 0, vw, vh);
 
         if (pose) {
-          const now = performance.now();
-          const res = await pose.detectForVideo(els.video, now);
-          detector.results = res;
+          // Estimate poses with MoveNet
+          const poses = await pose.estimatePoses(els.video);
+          if (poses && poses.length > 0) {
+            const kps = poses[0].keypoints || [];
+            // Map TFJS MoveNet keypoints to BlazePose-like indices we use elsewhere
+            const nameToIdx = {
+              nose: 0,
+              left_eye: 1, right_eye: 2,
+              left_ear: 3, right_ear: 4,
+              left_shoulder: 11, right_shoulder: 12,
+              left_elbow: 13, right_elbow: 14,
+              left_wrist: 15, right_wrist: 16,
+              left_hip: 23, right_hip: 24,
+              left_knee: 25, right_knee: 26,
+              left_ankle: 27, right_ankle: 28
+            };
+            const lms = Array(33).fill(null);
+            for (const kp of kps) {
+              if (!kp || kp.score < 0.3) continue;
+              const idx = nameToIdx[kp.name];
+              if (idx != null) {
+                lms[idx] = { x: kp.x / vw, y: kp.y / vh, z: 0 };
+              }
+            }
+            // Fallback: use left_ankle for left_heel index 29 if available
+            if (!lms[29] && lms[27]) lms[29] = lms[27];
+            detector.results = { landmarks: [lms] };
 
-          if (res.landmarks && res.landmarks.length > 0) {
-            const lms = res.landmarks[0];
+            // Draw + count
             detector.findPose(ctx, lms, vw, vh, true);
             const { lmList } = detector.findPosition(vw, vh, ctx, true, false);
             const newCount = pushup.detect(lmList);
