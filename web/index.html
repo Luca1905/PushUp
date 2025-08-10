@@ -25,33 +25,103 @@
       }
     </style>
     <script type="module">
-      import { FilesetResolver, PoseLandmarker, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+      import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
 
-      const els = {
-        room: null, name: null, connectBtn: null, status: null,
-        video: null, canvas: null,
-      };
+      const els = { room: null, name: null, connectBtn: null, status: null, video: null, canvas: null };
 
       let ws = null;
       let leader = [];
       let count = 0, sentCount = -1, lastSentTs = 0;
-      let stage = "UP"; // "UP" | "DOWN"
       let lastTs = 0;
       let pose = null;
       let running = false;
 
-      function angleDeg(ax, ay, bx, by, cx, cy) {
-        const baxx = ax - bx, baxy = ay - by;
-        const bcx = cx - bx, bcy = cy - by;
-        const nba = Math.hypot(baxx, baxy) || 1;
-        const nbc = Math.hypot(bcx, bcy) || 1;
-        const dot = (baxx / nba) * (bcx / nbc) + (baxy / nba) * (bcy / nbc);
-        const clamped = Math.max(-1, Math.min(1, dot));
-        return Math.acos(clamped) * 180 / Math.PI;
+      class PoseDetector {
+        constructor() { this.results = null; }
+        findPose(ctx, lms, vw, vh, draw = true) {
+          if (!draw) return;
+          ctx.save();
+          ctx.fillStyle = "#00d0ff";
+          for (let i = 0; i < lms.length; i++) {
+            const p = lms[i];
+            ctx.beginPath();
+            ctx.arc(p.x * vw, p.y * vh, 3, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.restore();
+        }
+        findPosition(vw, vh, ctx = null, draw = true, bboxWithHands = false) {
+          const lmList = [];
+          let bboxInfo = {};
+          let extra_feature = null;
+          const lms = this.results?.landmarks?.[0];
+          if (lms && lms.length) {
+            for (let id = 0; id < lms.length; id++) {
+              const lm = lms[id];
+              const cx = Math.round(lm.x * vw);
+              const cy = Math.round(lm.y * vh);
+              const cz = Math.round((lm.z || 0) * vw);
+              lmList.push([id, cx, cy, cz]);
+            }
+            const ad = Math.abs(lmList[12][1] - lmList[11][1]) >> 1;
+            let x1, x2;
+            if (bboxWithHands) {
+              x1 = lmList[16][1] - ad;
+              x2 = lmList[15][1] + ad;
+            } else {
+              x1 = lmList[12][1] - ad;
+              x2 = lmList[11][1] + ad;
+            }
+            const y2 = lmList[29][2] + ad;
+            const y1 = lmList[1][2] - ad;
+            const bbox = [x1, y1, x2 - x1, y2 - y1];
+            const cx = bbox[0] + (bbox[2] >> 1);
+            const cy = bbox[1] + (bbox[3] >> 1);
+            bboxInfo = { bbox, center: [cx, cy] };
+
+            const neck_x = Math.round((lmList[12][1] + lmList[11][1]) / 2);
+            const neck_y = Math.round((lmList[12][2] + lmList[11][2]) / 2);
+            extra_feature = [neck_x, neck_y];
+
+            if (draw && ctx) {
+              ctx.save();
+              ctx.strokeStyle = "rgba(255,0,255,0.9)";
+              ctx.lineWidth = 3;
+              ctx.strokeRect(bbox[0], bbox[1], bbox[2], bbox[3]);
+              ctx.fillStyle = "#0f0";
+              ctx.beginPath();
+              ctx.arc(neck_x, neck_y, 5, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.restore();
+            }
+          }
+          return { lmList, bboxInfo, extra_feature };
+        }
       }
 
+      class Pushup {
+        constructor() { this.count = 0; this.position = null; }
+        detect(lmList) {
+          if (lmList && lmList.length) {
+            const y = (i) => lmList[i]?.[2] ?? Infinity;
+            // Up position
+            if (y(12) > y(14) && y(11) > y(13) && y(12) > y(26) && y(24) > y(26) && y(23) > y(25)) {
+              this.position = "Up";
+            }
+            // Down transition -> count++
+            if (y(12) <= y(14) && y(11) <= y(13) && y(11) <= y(25) && y(24) <= y(26) && y(23) <= y(25) && this.position === "Up") {
+              this.position = "Down";
+              this.count += 1;
+            }
+          }
+          return this.count;
+        }
+      }
+
+      const detector = new PoseDetector();
+      const pushup = new Pushup();
+
       function drawHUD(ctx, w, h) {
-        // Local count (top-left)
         ctx.save();
         ctx.fillStyle = "rgba(0,0,0,0.6)";
         ctx.fillRect(12, 12, 220, 88);
@@ -59,7 +129,6 @@
         ctx.font = "20px system-ui, Arial";
         ctx.fillText(`Reps: ${count}`, 26, 50);
 
-        // Leaderboard (top-right)
         const pad = 12, lbw = 270;
         const rows = Math.min(10, leader.length);
         const boxH = 30 + 24 * rows;
@@ -83,16 +152,14 @@
         const now = performance.now() / 1000;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         if (count !== sentCount || (now - lastSentTs) > 2.0) {
-          ws.send(JSON.stringify({ type: "update", count: count|0 }));
+          ws.send(JSON.stringify({ type: "update", count: count | 0 }));
           sentCount = count;
           lastSentTs = now;
         }
       }
 
       async function setupPose() {
-        const fileset = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
-        );
+        const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
         pose = await PoseLandmarker.createFromOptions(fileset, {
           baseOptions: {
             modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
@@ -123,7 +190,6 @@
             }
           } catch {}
         };
-        // keepalive pings
         setInterval(() => {
           if (ws && ws.readyState === WebSocket.OPEN) {
             try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
@@ -138,60 +204,32 @@
         const vh = els.video.videoHeight;
         if (vw === 0 || vh === 0) return requestAnimationFrame(loop);
 
-        // size canvas once
-        if (els.canvas.width !== vw || els.canvas.height !== vh) {
-          els.canvas.width = vw; els.canvas.height = vh;
-        }
+        if (els.canvas.width !== vw || els.canvas.height !== vh) { els.canvas.width = vw; els.canvas.height = vh; }
 
-        // clear overlay (video is visible underneath)
         ctx.clearRect(0, 0, vw, vh);
 
-        // Run pose
         if (pose) {
           const now = performance.now();
           const res = await pose.detectForVideo(els.video, now);
+          detector.results = res;
 
-          // draw landmarks and count (do not draw the video on the canvas)
           if (res.landmarks && res.landmarks.length > 0) {
-            const lms = res.landmarks[0]; // 33 BlazePose points
-            const s = lms[12], e = lms[14], w = lms[16];
-            if (s && e && w) {
-              // normalized->pixel
-              const sx = s.x * vw, sy = s.y * vh;
-              const ex = e.x * vw, ey = e.y * vh;
-              const wx = w.x * vw, wy = w.y * vh;
-              const ang = angleDeg(sx, sy, ex, ey, wx, wy);
-
-              // stage transitions
-              if (ang < 70 && stage === "UP") stage = "DOWN";
-              else if (ang > 160 && stage === "DOWN") { stage = "UP"; count++; sendUpdateMaybe(); }
-
-              // viz elbow angle
-              ctx.fillStyle = "rgba(0,0,0,0.6)";
-              ctx.fillRect(10, vh - 34, 110, 26);
-              ctx.fillStyle = "#0f0";
-              ctx.font = "16px system-ui, Arial";
-              ctx.fillText(`Elbow: ${ang|0}`, 16, vh - 16);
-
-              // simple joints
-              ctx.fillStyle = "#0af";
-              for (const p of [s, e, w]) {
-                ctx.beginPath(); ctx.arc(p.x * vw, p.y * vh, 5, 0, Math.PI * 2); ctx.fill();
-              }
-            }
+            const lms = res.landmarks[0];
+            detector.findPose(ctx, lms, vw, vh, true);
+            const { lmList } = detector.findPosition(vw, vh, ctx, true, false);
+            const newCount = pushup.detect(lmList);
+            if (newCount !== count) { count = newCount; sendUpdateMaybe(); }
           }
 
-          // FPS (rough)
           const t = performance.now();
           const fps = lastTs ? 1000 / (t - lastTs) : 0;
           lastTs = t;
           ctx.fillStyle = "rgba(0,0,0,0.6)";
-          ctx.fillRect(10, vh - 64, 90, 24);
+          ctx.fillRect(10, vh - 34, 110, 24);
           ctx.fillStyle = "#fff";
           ctx.font = "14px system-ui, Arial";
-          ctx.fillText(`${fps.toFixed(1)} FPS`, 16, vh - 48);
+          ctx.fillText(`${fps.toFixed(1)} FPS`, 16, vh - 16);
 
-          // HUD with count + leaderboard
           drawHUD(ctx, vw, vh);
         }
 
@@ -206,7 +244,6 @@
         els.video = document.getElementById("video");
         els.canvas = document.getElementById("canvas");
 
-        // Prefill from URL params
         const url = new URL(location.href);
         els.room.value = (url.searchParams.get("room") || "ABCD").toUpperCase();
         els.name.value = url.searchParams.get("name") || "Player";
